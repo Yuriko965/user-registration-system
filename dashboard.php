@@ -7,44 +7,65 @@ if (!isset($_SESSION['user_id'])) {
     exit();
 }
 
-// Self-contained Activity Log helper using PDO ($pdo)
+// Self-contained Activity Log helper matched to your activity_logs table structure
 function logSystemActivity(
     PDO $pdo,
-    ?int $userId,
-    string $actorName,
+    ?int $actorUserId,
+    string $actorFullname,
+    ?string $actorCourseYearSec,
     string $actionType,
-    string $description,
-    ?string $targetInfo = null
+    string $description
 ): void {
     try {
+        $ipAddress = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? ($_SERVER['REMOTE_ADDR'] ?? 'Unknown');
+        if (strpos($ipAddress, ',') !== false) {
+            $ipAddress = trim(explode(',', $ipAddress)[0]);
+        }
+
         $stmt = $pdo->prepare(
-            "INSERT INTO activity_logs (user_id, actor_name, action_type, description, target_info)
-             VALUES (:user_id, :actor_name, :action_type, :description, :target_info)"
+            "INSERT INTO activity_logs (actor_user_id, actor_fullname, actor_course_year_sec, action_type, description, ip_address)
+             VALUES (:actor_user_id, :actor_fullname, :actor_course_year_sec, :action_type, :description, :ip_address)"
         );
         $stmt->execute([
-            ':user_id'     => $userId,
-            ':actor_name'  => $actorName,
-            ':action_type' => strtoupper($actionType),
-            ':description' => $description,
-            ':target_info' => $targetInfo,
+            ':actor_user_id'         => $actorUserId,
+            ':actor_fullname'        => $actorFullname,
+            ':actor_course_year_sec' => $actorCourseYearSec,
+            ':action_type'           => strtoupper($actionType),
+            ':description'           => $description,
+            ':ip_address'            => $ipAddress,
         ]);
     } catch (PDOException $e) {
-        // Ignore logging errors so dashboard continues working
+        // Avoid breaking dashboard rendering if logging fails
     }
 }
 
-$currentUserId = isset($_SESSION['user_id']) ? (int) $_SESSION['user_id'] : null;
-$currentActor  = $_SESSION['fullname'] ?? ($_SESSION['username'] ?? 'System User');
+$currentUserId   = isset($_SESSION['user_id']) ? (int) $_SESSION['user_id'] : null;
+$currentActor    = $_SESSION['fullname'] ?? ($_SESSION['username'] ?? 'System User');
+$currentCourse   = $_SESSION['course_year_sec'] ?? null;
 
-// Log a dashboard session entry once per login session if not yet logged
+// Fetch actor's course_year_sec from DB if not stored in session
+if ($currentCourse === null && $currentUserId !== null) {
+    try {
+        $meStmt = $pdo->prepare("SELECT fullname, course_year_sec FROM users WHERE id = :id LIMIT 1");
+        $meStmt->execute([':id' => $currentUserId]);
+        if ($meRow = $meStmt->fetch(PDO::FETCH_ASSOC)) {
+            $currentActor  = $meRow['fullname'] ?: $currentActor;
+            $currentCourse = $meRow['course_year_sec'] ?? null;
+        }
+    } catch (PDOException $e) {
+        // Fallback to session values
+    }
+}
+
+// Log dashboard access once per login session
 if (empty($_SESSION['dashboard_logged'])) {
     logSystemActivity(
         $pdo,
         $currentUserId,
         $currentActor,
+        $currentCourse,
         'LOGIN',
-        'Accessed the main dashboard',
-        'Session Active'
+        'Accessed the main dashboard'
     );
     $_SESSION['dashboard_logged'] = true;
 }
@@ -70,9 +91,9 @@ if (isset($_GET['delete'])) {
                 $pdo,
                 $currentUserId,
                 $currentActor,
+                $currentCourse,
                 'DELETED',
-                'Deleted a user account record',
-                $targetSummary
+                'Deleted user record: ' . $targetSummary
             );
         }
     }
@@ -94,11 +115,11 @@ if (!in_array($order, $allowed_orders, true)) $order = 'ASC';
 $stmt = $pdo->query("SELECT * FROM users ORDER BY $sort_by $order");
 $users = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-// Fetch Recent System Activity logs
+// Fetch Recent System Activity logs using actual column names
 $activityLogs = [];
 try {
     $logStmt = $pdo->query(
-        "SELECT id, actor_name, action_type, description, target_info, created_at
+        "SELECT id, actor_fullname, actor_course_year_sec, action_type, description, ip_address, created_at
          FROM activity_logs
          ORDER BY created_at DESC, id DESC
          LIMIT 15"
@@ -417,8 +438,9 @@ try {
                             <th>#</th>
                             <th>Action</th>
                             <th>Actor</th>
+                            <th>Course / Year / Sec</th>
                             <th>Activity</th>
-                            <th>Target</th>
+                            <th>IP Address</th>
                             <th>Timestamp</th>
                         </tr>
                     </thead>
@@ -439,9 +461,10 @@ try {
                         <tr>
                             <td><?= $logCount++ ?></td>
                             <td><span class="badge <?= $badgeClass ?>"><?= htmlspecialchars($action) ?></span></td>
-                            <td class="fw-semibold"><?= htmlspecialchars($log['actor_name']) ?></td>
+                            <td class="fw-semibold"><?= htmlspecialchars($log['actor_fullname']) ?></td>
+                            <td><?= htmlspecialchars($log['actor_course_year_sec'] ?? '—') ?></td>
                             <td><?= htmlspecialchars($log['description']) ?></td>
-                            <td><?= htmlspecialchars($log['target_info'] ?? '—') ?></td>
+                            <td><code><?= htmlspecialchars($log['ip_address'] ?? '—') ?></code></td>
                             <td><?= htmlspecialchars($log['created_at']) ?></td>
                         </tr>
                         <?php endforeach; ?>
@@ -468,18 +491,28 @@ try {
                         <span class="small opacity-75"><?= htmlspecialchars($log['created_at']) ?></span>
                     </div>
                     <div class="user-card-body">
-                        <div class="card-field-group">
-                            <span class="card-label">Actor</span>
-                            <span class="card-value fw-semibold"><?= htmlspecialchars($log['actor_name']) ?></span>
+                        <div class="row g-2">
+                            <div class="col-6">
+                                <div class="card-field-group">
+                                    <span class="card-label">Actor</span>
+                                    <span class="card-value fw-semibold"><?= htmlspecialchars($log['actor_fullname']) ?></span>
+                                </div>
+                            </div>
+                            <div class="col-6">
+                                <div class="card-field-group">
+                                    <span class="card-label">Course / Sec</span>
+                                    <span class="card-value"><?= htmlspecialchars($log['actor_course_year_sec'] ?? '—') ?></span>
+                                </div>
+                            </div>
                         </div>
                         <div class="card-field-group">
                             <span class="card-label">Activity</span>
                             <span class="card-value"><?= htmlspecialchars($log['description']) ?></span>
                         </div>
-                        <?php if (!empty($log['target_info'])): ?>
+                        <?php if (!empty($log['ip_address'])): ?>
                         <div class="card-field-group">
-                            <span class="card-label">Target</span>
-                            <span class="card-value"><?= htmlspecialchars($log['target_info']) ?></span>
+                            <span class="card-label">IP Address</span>
+                            <span class="card-value"><code><?= htmlspecialchars($log['ip_address']) ?></code></span>
                         </div>
                         <?php endif; ?>
                     </div>
