@@ -7,27 +7,106 @@ if (!isset($_SESSION['user_id'])) {
     exit();
 }
 
-// Handle Delete Record
+// Self-contained Activity Log helper using PDO ($pdo)
+function logSystemActivity(
+    PDO $pdo,
+    ?int $userId,
+    string $actorName,
+    string $actionType,
+    string $description,
+    ?string $targetInfo = null
+): void {
+    try {
+        $stmt = $pdo->prepare(
+            "INSERT INTO activity_logs (user_id, actor_name, action_type, description, target_info)
+             VALUES (:user_id, :actor_name, :action_type, :description, :target_info)"
+        );
+        $stmt->execute([
+            ':user_id'     => $userId,
+            ':actor_name'  => $actorName,
+            ':action_type' => strtoupper($actionType),
+            ':description' => $description,
+            ':target_info' => $targetInfo,
+        ]);
+    } catch (PDOException $e) {
+        // Ignore logging errors so dashboard continues working
+    }
+}
+
+$currentUserId = isset($_SESSION['user_id']) ? (int) $_SESSION['user_id'] : null;
+$currentActor  = $_SESSION['fullname'] ?? ($_SESSION['username'] ?? 'System User');
+
+// Log a dashboard session entry once per login session if not yet logged
+if (empty($_SESSION['dashboard_logged'])) {
+    logSystemActivity(
+        $pdo,
+        $currentUserId,
+        $currentActor,
+        'LOGIN',
+        'Accessed the main dashboard',
+        'Session Active'
+    );
+    $_SESSION['dashboard_logged'] = true;
+}
+
+// Handle Delete Record + Log Activity
 if (isset($_GET['delete'])) {
-    $id = $_GET['delete'];
-    $stmt = $pdo->prepare("DELETE FROM users WHERE id = ?");
-    $stmt->execute([$id]);
+    $id = (int) $_GET['delete'];
+
+    if ($id > 0) {
+        $infoStmt = $pdo->prepare("SELECT fullname, username, course_year_sec FROM users WHERE id = :id LIMIT 1");
+        $infoStmt->execute([':id' => $id]);
+        $targetUser = $infoStmt->fetch(PDO::FETCH_ASSOC);
+
+        $stmt = $pdo->prepare("DELETE FROM users WHERE id = :id");
+        $stmt->execute([':id' => $id]);
+
+        if ($stmt->rowCount() > 0) {
+            $targetSummary = $targetUser
+                ? ($targetUser['fullname'] . ' (' . $targetUser['username'] . ' - ' . $targetUser['course_year_sec'] . ')')
+                : ('User ID #' . $id);
+
+            logSystemActivity(
+                $pdo,
+                $currentUserId,
+                $currentActor,
+                'DELETED',
+                'Deleted a user account record',
+                $targetSummary
+            );
+        }
+    }
+
     header("Location: dashboard.php");
     exit();
 }
 
 // Sorting logic
 $sort_by = $_GET['sort'] ?? 'id';
-$order = $_GET['order'] ?? 'ASC';
+$order = strtoupper($_GET['order'] ?? 'ASC');
 
 $allowed_sorts = ['id', 'fullname', 'username', 'created_at'];
 $allowed_orders = ['ASC', 'DESC'];
 
-if (!in_array($sort_by, $allowed_sorts)) $sort_by = 'id';
-if (!in_array($order, $allowed_orders)) $order = 'ASC';
+if (!in_array($sort_by, $allowed_sorts, true)) $sort_by = 'id';
+if (!in_array($order, $allowed_orders, true)) $order = 'ASC';
 
 $stmt = $pdo->query("SELECT * FROM users ORDER BY $sort_by $order");
-$users = $stmt->fetchAll();
+$users = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// Fetch Recent System Activity logs
+$activityLogs = [];
+try {
+    $logStmt = $pdo->query(
+        "SELECT id, actor_name, action_type, description, target_info, created_at
+         FROM activity_logs
+         ORDER BY created_at DESC, id DESC
+         LIMIT 15"
+    );
+    $activityLogs = $logStmt->fetchAll(PDO::FETCH_ASSOC);
+} catch (PDOException $e) {
+    $activityLogs = [];
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -84,7 +163,7 @@ $users = $stmt->fetchAll();
             text-decoration: none; font-size: 1.1rem; transition: all 0.2s;
         }
         .theme-toggle-btn:hover, .about-btn:hover { background: rgba(255,255,255,0.4); color: #fff; }
-        
+
         .modal-content {
             background: var(--bg-container);
             backdrop-filter: blur(20px);
@@ -96,6 +175,7 @@ $users = $stmt->fetchAll();
         /* Desktop vs Mobile Switcher */
         .desktop-table { display: table; width: 100%; }
         .mobile-cards-view { display: none; }
+        .activity-mobile-view { display: none; }
 
         .table-glass th, .table-glass td {
             background: var(--table-bg) !important;
@@ -103,13 +183,11 @@ $users = $stmt->fetchAll();
             backdrop-filter: blur(6px);
         }
 
-        /* ----------------------------------------------------------------- */
-        /* MOBILE PORTRAIT COMFORT OPTIMIZATION                               */
-        /* ----------------------------------------------------------------- */
         @media (max-width: 768px) {
             .desktop-table { display: none !important; }
             .mobile-cards-view { display: flex; flex-direction: column; gap: 16px; }
-            
+            .activity-mobile-view { display: flex; flex-direction: column; gap: 12px; }
+
             .glass-container {
                 padding: 1.25rem !important;
                 border-radius: 16px;
@@ -166,9 +244,8 @@ $users = $stmt->fetchAll();
                 font-weight: 600;
                 border-radius: 10px;
             }
-            /* Navbar adjustments for mobile portrait */
             .navbar-brand { font-size: 1.1rem; }
-            .welcome-text { display: none; } /* Hide long welcome on small screens to save space */
+            .welcome-text { display: none; }
         }
     </style>
 </head>
@@ -179,7 +256,7 @@ $users = $stmt->fetchAll();
         <div class="d-flex align-items-center gap-2 gap-md-3">
             <div id="realtimeClock" class="realtime-clock d-none d-lg-block"></div>
             <span class="text-light welcome-text">Welcome, <b><?= htmlspecialchars($_SESSION['fullname'] ?? $_SESSION['username']) ?></b></span>
-            
+
             <button class="about-btn" data-bs-toggle="modal" data-bs-target="#aboutModal" title="About System">ℹ️</button>
             <button class="theme-toggle-btn" id="themeToggle" title="Toggle Light/Dark Mode">☀️</button>
             <a href="logout.php" class="btn btn-outline-light btn-sm px-3 rounded-pill">Logout</a>
@@ -212,10 +289,11 @@ $users = $stmt->fetchAll();
 </div>
 
 <div class="container mt-3 mt-md-5 mb-5">
+    <!-- Registered Users Section -->
     <div class="glass-container p-3 p-md-5">
         <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center mb-4 gap-3">
             <h2 class="fw-bold m-0 fs-3">Registered Users</h2>
-            
+
             <!-- Sorting Controls Form -->
             <form method="GET" action="dashboard.php" class="d-flex align-items-center gap-2">
                 <label class="fw-semibold text-nowrap fs-6">Sort:</label>
@@ -248,9 +326,9 @@ $users = $stmt->fetchAll();
                     </tr>
                 </thead>
                 <tbody>
-                    <?php 
+                    <?php
                     $count = 1;
-                    foreach($users as $row): 
+                    foreach($users as $row):
                     ?>
                     <tr>
                         <td><?= $count++ ?></td>
@@ -258,7 +336,7 @@ $users = $stmt->fetchAll();
                         <td><?= htmlspecialchars($row['username']) ?></td>
                         <td><?= htmlspecialchars($row['email']) ?></td>
                         <td><?= htmlspecialchars($row['course_year_sec']) ?></td>
-                        <td><?= $row['created_at'] ?></td>
+                        <td><?= htmlspecialchars($row['created_at']) ?></td>
                         <td>
                             <a href="edit.php?id=<?= $row['id'] ?>" class="btn btn-warning btn-sm fw-semibold shadow-sm">Edit</a>
                             <a href="dashboard.php?delete=<?= $row['id'] ?>" class="btn btn-danger btn-sm fw-semibold shadow-sm" onclick="return confirm('Are you sure you want to delete this record?')">Delete</a>
@@ -271,14 +349,14 @@ $users = $stmt->fetchAll();
 
         <!-- 2. MOBILE PORTRAIT VIEW (Comfortable Touch Cards Layout) -->
         <div class="mobile-cards-view">
-            <?php 
+            <?php
             $m_count = 1;
-            foreach($users as $row): 
+            foreach($users as $row):
             ?>
             <div class="user-card-item">
                 <div class="user-card-header">
                     <span class="badge bg-primary px-3 py-2 fs-6">Entry #<?= $m_count++ ?></span>
-                    <span class="small text-muted"><?= $row['created_at'] ?></span>
+                    <span class="small opacity-75"><?= htmlspecialchars($row['created_at']) ?></span>
                 </div>
                 <div class="user-card-body">
                     <div class="card-field-group">
@@ -311,7 +389,104 @@ $users = $stmt->fetchAll();
             </div>
             <?php endforeach; ?>
         </div>
+    </div>
 
+    <!-- Activity Log / Recent System Activity Section -->
+    <div class="glass-container p-3 p-md-5 mt-4">
+        <div class="d-flex flex-column flex-sm-row justify-content-between align-items-sm-center mb-3 gap-2">
+            <div>
+                <h2 class="fw-bold m-0 fs-4">Activity Log / Recent System Activity</h2>
+                <small class="opacity-75">Latest recorded events across system accounts and actions</small>
+            </div>
+            <span class="badge bg-info text-dark px-3 py-2 rounded-pill align-self-start align-self-sm-center">
+                Latest <?= count($activityLogs) ?> Events
+            </span>
+        </div>
+        <hr>
+
+        <?php if (empty($activityLogs)): ?>
+            <div class="alert alert-secondary mb-0">
+                No recent system activity recorded yet.
+            </div>
+        <?php else: ?>
+            <!-- Desktop Activity Table -->
+            <div class="table-responsive d-none d-md-block">
+                <table class="table table-bordered table-hover table-glass align-middle shadow-sm rounded overflow-hidden mb-0">
+                    <thead class="table-dark">
+                        <tr>
+                            <th>#</th>
+                            <th>Action</th>
+                            <th>Actor</th>
+                            <th>Activity</th>
+                            <th>Target</th>
+                            <th>Timestamp</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php
+                        $logCount = 1;
+                        foreach ($activityLogs as $log):
+                            $action = strtoupper($log['action_type']);
+                            $badgeClass = match ($action) {
+                                'LOGIN'      => 'bg-success',
+                                'LOGOUT'     => 'bg-secondary',
+                                'REGISTERED' => 'bg-primary',
+                                'UPDATED'    => 'bg-warning text-dark',
+                                'DELETED'    => 'bg-danger',
+                                default      => 'bg-info text-dark',
+                            };
+                        ?>
+                        <tr>
+                            <td><?= $logCount++ ?></td>
+                            <td><span class="badge <?= $badgeClass ?>"><?= htmlspecialchars($action) ?></span></td>
+                            <td class="fw-semibold"><?= htmlspecialchars($log['actor_name']) ?></td>
+                            <td><?= htmlspecialchars($log['description']) ?></td>
+                            <td><?= htmlspecialchars($log['target_info'] ?? '—') ?></td>
+                            <td><?= htmlspecialchars($log['created_at']) ?></td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Mobile Activity Cards -->
+            <div class="activity-mobile-view">
+                <?php foreach ($activityLogs as $log):
+                    $action = strtoupper($log['action_type']);
+                    $badgeClass = match ($action) {
+                        'LOGIN'      => 'bg-success',
+                        'LOGOUT'     => 'bg-secondary',
+                        'REGISTERED' => 'bg-primary',
+                        'UPDATED'    => 'bg-warning text-dark',
+                        'DELETED'    => 'bg-danger',
+                        default      => 'bg-info text-dark',
+                    };
+                ?>
+                <div class="user-card-item">
+                    <div class="user-card-header">
+                        <span class="badge <?= $badgeClass ?> px-3 py-2"><?= htmlspecialchars($action) ?></span>
+                        <span class="small opacity-75"><?= htmlspecialchars($log['created_at']) ?></span>
+                    </div>
+                    <div class="user-card-body">
+                        <div class="card-field-group">
+                            <span class="card-label">Actor</span>
+                            <span class="card-value fw-semibold"><?= htmlspecialchars($log['actor_name']) ?></span>
+                        </div>
+                        <div class="card-field-group">
+                            <span class="card-label">Activity</span>
+                            <span class="card-value"><?= htmlspecialchars($log['description']) ?></span>
+                        </div>
+                        <?php if (!empty($log['target_info'])): ?>
+                        <div class="card-field-group">
+                            <span class="card-label">Target</span>
+                            <span class="card-value"><?= htmlspecialchars($log['target_info']) ?></span>
+                        </div>
+                        <?php endif; ?>
+                    </div>
+                </div>
+                <?php endforeach; ?>
+            </div>
+        <?php endif; ?>
     </div>
 </div>
 
