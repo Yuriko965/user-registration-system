@@ -3,7 +3,7 @@
 A full-stack web-based CRUD (Create, Read, Update, Delete) user management and authentication system built with **PHP**, **MySQL (PDO)**, **HTML5**, **CSS3**, and **Bootstrap 5**. Designed with a modern Glassmorphism and Neumorphism interface, adaptive layouts for mobile portrait and desktop landscape screens, light/dark theme switching, and real-time clock widgets.
 
 ## Developer
-* **Web Developer:** Jaymart Azucena 3BNT
+* **Web Developer:** Jaymart Azucena 3ANT
 * **Course Context:** Web Systems Technologies
 
 ---
